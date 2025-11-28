@@ -14,6 +14,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+# Try to import gdown for Google Drive downloads (handles virus scan automatically)
+try:
+    import gdown
+    GDOWN_AVAILABLE = True
+except ImportError:
+    GDOWN_AVAILABLE = False
+    logging.warning("gdown not available, will use fallback method")
+
 # Import our model analyzer
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -204,9 +212,9 @@ def search_dataset(
     )
     return results
 
-def download_file_from_google_drive(file_id: str, destination: str) -> bool:
+def download_file_from_google_drive_gdown(file_id: str, destination: str) -> bool:
     """
-    Download a file from Google Drive, handling large file virus scan warnings.
+    Download a file from Google Drive using gdown library (handles virus scan automatically).
     
     Args:
         file_id: Google Drive file ID
@@ -215,45 +223,120 @@ def download_file_from_google_drive(file_id: str, destination: str) -> bool:
     Returns:
         bool: True if successful, False otherwise
     """
+    if not GDOWN_AVAILABLE:
+        logger.warning("gdown not available, cannot use this download method")
+        return False
+        
     try:
-        logger.info(f"Downloading file from Google Drive: {file_id} -> {destination}")
+        logger.info(f"Downloading with gdown: {file_id} -> {destination}")
+        
+        # gdown URL format
+        url = f"https://drive.google.com/uc?id={file_id}"
+        
+        # Download with gdown (it handles virus scan automatically)
+        output = gdown.download(url, destination, quiet=False, fuzzy=True)
+        
+        if output is None:
+            logger.error("gdown returned None - download failed")
+            return False
+        
+        # Verify file exists and has reasonable size
+        if not os.path.exists(destination):
+            logger.error(f"File not found after download: {destination}")
+            return False
+        
+        file_size = os.path.getsize(destination)
+        logger.info(f"Successfully downloaded with gdown: {destination} ({file_size / (1024*1024):.2f} MB)")
+        
+        # Verify file is not too small (likely an error)
+        if destination.endswith('.safetensors') and file_size < 1000000:  # Less than 1MB
+            logger.error(f"Downloaded file is suspiciously small ({file_size} bytes)")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error downloading with gdown: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
+
+
+def download_file_from_google_drive(file_id: str, destination: str) -> bool:
+    """
+    Download a file from Google Drive, handling large file virus scan warnings.
+    Uses gdown if available (preferred), falls back to manual method.
+    
+    Args:
+        file_id: Google Drive file ID
+        destination: Local file path to save to
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    # Try gdown first (it handles virus scan automatically)
+    if GDOWN_AVAILABLE:
+        logger.info("Attempting download with gdown (preferred method)...")
+        if download_file_from_google_drive_gdown(file_id, destination):
+            return True
+        logger.warning("gdown download failed, trying fallback method...")
+    
+    # Fallback to manual method
+    try:
+        logger.info(f"Downloading file from Google Drive (fallback): {file_id} -> {destination}")
         
         # Google Drive download URL
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
         
         session = requests.Session()
+        
+        # First request to get the page/file
         response = session.get(url, stream=True)
         
-        # Handle large file virus scan warning
-        # Google shows a warning page for files >100MB that contains a confirmation token
-        token = None
-        for key, value in response.cookies.items():
-            if key.startswith('download_warning'):
-                token = value
-                break
+        # Check if we got a virus scan warning page
+        content_type = response.headers.get('content-type', '')
         
-        # If we got a token, we need to make another request with confirmation
-        if token:
-            logger.info("Large file detected, bypassing virus scan warning...")
-            params = {'confirm': token, 'id': file_id}
-            response = session.get(url, params=params, stream=True)
-        
-        # Also check for the UUID token in the response content (newer Google Drive behavior)
-        if not token and response.status_code == 200:
-            # Check if response is HTML (virus scan page) instead of binary file
-            content_type = response.headers.get('content-type', '')
-            if 'text/html' in content_type:
-                # Parse the response to find the download link with confirmation
-                text_content = response.text
-                if 'download_warning' in text_content or 'virus' in text_content.lower():
-                    # Try to extract the confirm token from HTML
-                    import re
-                    match = re.search(r'confirm=([^&"]+)', text_content)
-                    if match:
-                        token = match.group(1)
-                        logger.info(f"Extracted confirmation token from HTML: {token[:20]}...")
-                        params = {'confirm': token, 'id': file_id}
-                        response = session.get(url, params=params, stream=True)
+        if 'text/html' in content_type:
+            logger.info("Received HTML page (likely virus scan warning), extracting confirmation...")
+            
+            # Read the HTML content to extract the confirmation token
+            html_content = response.text
+            
+            # Try multiple patterns to extract the confirm token
+            import re
+            
+            patterns = [
+                r'confirm=([a-zA-Z0-9_-]+)',
+                r'id="download-form"[^>]*action="[^"]*confirm=([a-zA-Z0-9_-]+)',
+                r'"downloadUrl":"[^"]*confirm=([a-zA-Z0-9_-]+)',
+            ]
+            
+            confirm_token = None
+            for pattern in patterns:
+                match = re.search(pattern, html_content)
+                if match:
+                    confirm_token = match.group(1)
+                    logger.info(f"Found confirmation token using pattern")
+                    break
+            
+            # Check cookies as well
+            if not confirm_token:
+                for key, value in response.cookies.items():
+                    if 'download_warning' in key.lower() or 'confirm' in key.lower():
+                        confirm_token = value
+                        logger.info(f"Found confirmation token in cookies")
+                        break
+            
+            if confirm_token:
+                # Make a new request with the confirmation token
+                logger.info(f"Using confirmation token...")
+                params = {'id': file_id, 'confirm': confirm_token}
+                response = session.get(url, params=params, stream=True)
+            else:
+                # Try confirm=t (works for some files)
+                logger.info("No token found, trying confirm=t...")
+                params = {'id': file_id, 'confirm': 't'}
+                response = session.get(url, params=params, stream=True)
         
         # Check if successful
         if response.status_code != 200:
@@ -262,7 +345,7 @@ def download_file_from_google_drive(file_id: str, destination: str) -> bool:
         
         # Verify we're getting binary content, not HTML error page
         content_type = response.headers.get('content-type', '')
-        if 'text/html' in content_type and destination.endswith('.safetensors'):
+        if 'text/html' in content_type:
             logger.error(f"Received HTML instead of binary file. Download may have failed.")
             return False
         
