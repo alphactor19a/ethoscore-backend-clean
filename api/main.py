@@ -6,26 +6,19 @@ import os
 import logging
 import requests
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-try:
-    import gdown
-    GDOWN_AVAILABLE = True
-except ImportError:
-    GDOWN_AVAILABLE = False
-    logging.warning("gdown not available, will use fallback method")
 
 # Import our model analyzer
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.model_analyzer import ArticleFramingAnalyzer, ModelLoadingError, ModelInferenceError
-from src.article_processor import extract_article_from_url, ArticleExtractionError
 
 # Set up logging
 logging.basicConfig(
@@ -34,54 +27,182 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Global analyzer instance
+# Global analyzer and dataset instances
 analyzer: Optional[ArticleFramingAnalyzer] = None
-dataset_loaded = False
+dataset_loaded: bool = False
+_dataset_df: Optional[pd.DataFrame] = None
+_dataset_path: Optional[Path] = None
 
-def download_file_from_google_drive_gdown(file_id: str, destination: str) -> bool:
+
+def load_dataset() -> Optional[pd.DataFrame]:
     """
-    Download a file from Google Drive using gdown library (handles virus scan automatically).
-    
-    Args:
-        file_id: Google Drive file ID
-        destination: Local file path to save to
-        
-    Returns:
-        bool: True if successful, False otherwise
+    Load the framing annotations dataset into memory (cached global DataFrame).
     """
+    global _dataset_df, dataset_loaded, _dataset_path
+
+    base_dir = Path(__file__).parent.parent
+    dataset_path = base_dir / "Dataset-framing_annotations-Llama-3.3-70B-Instruct-Turbo.csv"
+    _dataset_path = dataset_path
+
+    if _dataset_df is not None:
+        return _dataset_df
+
+    if not dataset_path.exists():
+        logger.warning(f"Dataset file not found at {dataset_path}")
+        dataset_loaded = False
+        return None
+
     try:
-        logger.info(f"Downloading with gdown: {file_id} -> {destination}")
-        
-        # gdown URL format
-        url = f"https://drive.google.com/uc?id={file_id}"
-        
-        # Download with gdown (it handles virus scan automatically)
-        output = gdown.download(url, destination, quiet=False, fuzzy=True)
-        
-        if output is None:
-            logger.error("gdown returned None - download failed")
-            return False
-        
-        # Verify file exists and has reasonable size
-        if not os.path.exists(destination):
-            logger.error(f"File not found after download: {destination}")
-            return False
-        
-        file_size = os.path.getsize(destination)
-        logger.info(f"Successfully downloaded with gdown: {destination} ({file_size / (1024*1024):.2f} MB)")
-        
-        # Verify file is not too small (likely an error)
-        if destination.endswith('.safetensors') and file_size < 1000000:  # Less than 1MB
-            logger.error(f"Downloaded file is suspiciously small ({file_size} bytes)")
-            return False
-        
-        return True
-        
+        logger.info(f"Loading dataset for topic exploration from {dataset_path}...")
+        df = pd.read_csv(dataset_path)
+        logger.info(
+            f"Loaded dataset with {len(df)} rows and {len(df.columns)} columns: {list(df.columns)}"
+        )
+        _dataset_df = df
+        dataset_loaded = True
+        return _dataset_df
     except Exception as e:
-        logger.error(f"Error downloading with gdown: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return False
+        logger.error(f"Failed to load dataset from {dataset_path}: {e}")
+        dataset_loaded = False
+        _dataset_df = None
+        return None
+
+
+def _choose_column(columns: List[str], keywords: List[str]) -> Optional[str]:
+    """
+    Pick the first column whose name contains any of the given keywords.
+    """
+    lowered = [c.lower() for c in columns]
+    for kw in keywords:
+        for col, lower_name in zip(columns, lowered):
+            if kw in lower_name:
+                return col
+    return None
+
+
+def search_dataset(
+    topic: str,
+    limit: int = 3,
+    label: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Search the precomputed dataset for rows matching the topic (and optional label).
+
+    Uses the specific dataset schema from the Llama-3.3 annotated dataset:
+    - 'concept' column: topic category (primary search target)
+    - 'title' column: article title (secondary search)
+    - 'body' column: article body text (secondary search)  
+    - 'FRAMING_CLASS' column: framing label (NEUTRAL, LOADED, ALARMIST)
+    - 'source' column: source information
+    """
+    global _dataset_df, _dataset_path
+
+    if not topic:
+        return []
+
+    if _dataset_df is None:
+        df = load_dataset()
+    else:
+        df = _dataset_df
+
+    if df is None or df.empty:
+        logger.warning("Dataset is not loaded or is empty; topic search cannot proceed")
+        return []
+
+    topic_str = str(topic).strip()
+    topic_lower = topic_str.lower()
+
+    dataset_display_path = str(_dataset_path) if _dataset_path is not None else "<in-memory>"
+    logger.info(
+        f"Searching dataset {dataset_display_path} for topic '{topic_str}'"
+    )
+
+    # Build topic filter mask - search in concept, title, and body columns
+    mask = pd.Series(False, index=df.index)
+    
+    # Primary: Search in 'concept' column (topic category)
+    if 'concept' in df.columns:
+        concept_match = df['concept'].astype(str).str.contains(topic_lower, case=False, na=False)
+        mask |= concept_match
+        logger.info(f"Found {concept_match.sum()} matches in 'concept' column")
+    
+    # Secondary: Search in 'title' column
+    if 'title' in df.columns:
+        title_match = df['title'].astype(str).str.contains(topic_lower, case=False, na=False)
+        mask |= title_match
+        logger.info(f"Found {title_match.sum()} matches in 'title' column")
+    
+    # Secondary: Search in 'body' column
+    if 'body' in df.columns:
+        body_match = df['body'].astype(str).str.contains(topic_lower, case=False, na=False)
+        mask |= body_match
+        logger.info(f"Found {body_match.sum()} matches in 'body' column")
+
+    # Apply framing label filter using FRAMING_CLASS column
+    if label:
+        label_upper = str(label).strip().upper()
+        if 'FRAMING_CLASS' in df.columns:
+            label_mask = df['FRAMING_CLASS'].astype(str).str.upper() == label_upper
+            mask &= label_mask
+            logger.info(f"Applied FRAMING_CLASS filter: '{label_upper}'")
+        else:
+            logger.warning("'FRAMING_CLASS' column not found in dataset")
+
+    filtered = df[mask]
+    
+    if filtered.empty:
+        logger.info(f"Topic search for '{topic_str}' returning 0 results")
+        return []
+
+    logger.info(f"Found {len(filtered)} total matches, returning top {limit}")
+
+    results: List[Dict[str, Any]] = []
+
+    for _, row in filtered.head(limit).iterrows():
+        record: Dict[str, Any] = {}
+
+        # Title
+        if 'title' in df.columns and pd.notna(row.get('title')):
+            record["title"] = str(row['title']).strip()
+        else:
+            record["title"] = topic_str
+
+        # Body preview
+        if 'body' in df.columns and pd.notna(row.get('body')):
+            body_text = str(row['body'])
+            record["body_preview"] = body_text[:2000]
+
+        # Source - handle both string and dict formats
+        if 'source' in df.columns and pd.notna(row.get('source')):
+            source_val = row['source']
+            if isinstance(source_val, dict):
+                record["source"] = source_val.get('title') or source_val.get('uri', str(source_val))
+            else:
+                record["source"] = str(source_val)
+
+        # Concept/topic category
+        if 'concept' in df.columns and pd.notna(row.get('concept')):
+            record["concept"] = str(row['concept'])
+
+        # URL if available
+        if 'url' in df.columns and pd.notna(row.get('url')):
+            record["source_url"] = str(row['url'])
+
+        # Framing label from FRAMING_CLASS column
+        if 'FRAMING_CLASS' in df.columns and pd.notna(row.get('FRAMING_CLASS')):
+            framing_label = str(row['FRAMING_CLASS']).strip()
+            # Normalize to title case for display
+            framing_label_display = framing_label.title()
+            record["ordinal_analysis"] = {"predicted_label": framing_label_display}
+            record["classification_analysis"] = {"predicted_label": framing_label_display}
+            record["framing_class"] = framing_label_display
+
+        results.append(record)
+
+    logger.info(
+        f"Topic search for '{topic_str}' returning {len(results)} results (limit={limit})"
+    )
+    return results
 
 def download_file_from_google_drive(file_id: str, destination: str) -> bool:
     """
@@ -101,90 +222,60 @@ def download_file_from_google_drive(file_id: str, destination: str) -> bool:
         url = f"https://drive.google.com/uc?export=download&id={file_id}"
         
         session = requests.Session()
-        
-        # First request to get the page/file
         response = session.get(url, stream=True)
         
-        # Check if we got a virus scan warning page
-        content_type = response.headers.get('content-type', '')
+        # Handle large file virus scan warning
+        # Google shows a warning page for files >100MB that contains a confirmation token
+        token = None
+        for key, value in response.cookies.items():
+            if key.startswith('download_warning'):
+                token = value
+                break
         
-        if 'text/html' in content_type:
-            logger.info("Received HTML page (likely virus scan warning), extracting confirmation...")
-            
-            # Read the HTML content to extract the confirmation token
-            html_content = response.text
-            
-            # Try multiple patterns to extract the confirm token
-            import re
-            
-            # Pattern 1: Look for confirm parameter in forms or links
-            patterns = [
-                r'confirm=([a-zA-Z0-9_-]+)',
-                r'id="download-form"[^>]*action="[^"]*confirm=([a-zA-Z0-9_-]+)',
-                r'"downloadUrl":"[^"]*confirm=([a-zA-Z0-9_-]+)',
-                r'confirm=([^&"\s]+)',
-            ]
-            
-            confirm_token = None
-            for pattern in patterns:
-                match = re.search(pattern, html_content)
-                if match:
-                    confirm_token = match.group(1)
-                    logger.info(f"Found confirmation token using pattern: {pattern[:30]}...")
-                    break
-            
-            # Check cookies as well
-            if not confirm_token:
-                for key, value in response.cookies.items():
-                    if 'download_warning' in key.lower() or 'confirm' in key.lower():
-                        confirm_token = value
-                        logger.info(f"Found confirmation token in cookies: {key}")
-                        break
-            
-            if confirm_token:
-                # Make a new request with the confirmation token
-                logger.info(f"Using confirmation token: {confirm_token[:20]}...")
-                params = {'id': file_id, 'confirm': confirm_token}
-                response = session.get(url, params=params, stream=True)
-            else:
-                # Try the alternative method: use confirm=t (works for some files)
-                logger.info("No token found, trying confirm=t...")
-                params = {'id': file_id, 'confirm': 't'}
-                response = session.get(url, params=params, stream=True)
+        # If we got a token, we need to make another request with confirmation
+        if token:
+            logger.info("Large file detected, bypassing virus scan warning...")
+            params = {'confirm': token, 'id': file_id}
+            response = session.get(url, params=params, stream=True)
+        
+        # Also check for the UUID token in the response content (newer Google Drive behavior)
+        if not token and response.status_code == 200:
+            # Check if response is HTML (virus scan page) instead of binary file
+            content_type = response.headers.get('content-type', '')
+            if 'text/html' in content_type:
+                # Parse the response to find the download link with confirmation
+                text_content = response.text
+                if 'download_warning' in text_content or 'virus' in text_content.lower():
+                    # Try to extract the confirm token from HTML
+                    import re
+                    match = re.search(r'confirm=([^&"]+)', text_content)
+                    if match:
+                        token = match.group(1)
+                        logger.info(f"Extracted confirmation token from HTML: {token[:20]}...")
+                        params = {'confirm': token, 'id': file_id}
+                        response = session.get(url, params=params, stream=True)
         
         # Check if successful
         if response.status_code != 200:
             logger.error(f"Failed to download file. Status code: {response.status_code}")
             return False
         
-        # Double-check we're not still getting HTML
+        # Verify we're getting binary content, not HTML error page
         content_type = response.headers.get('content-type', '')
-        if 'text/html' in content_type:
-            logger.error(f"Still receiving HTML after confirmation attempt.")
-            # Try one more time with confirm=t
-            logger.info("Final attempt with confirm=t...")
-            params = {'id': file_id, 'confirm': 't', 'uuid': ''}
-            response = session.get(url, params=params, stream=True)
-            
-            content_type = response.headers.get('content-type', '')
-            if 'text/html' in content_type:
-                logger.error(f"Unable to bypass virus scan warning. File may need different sharing settings.")
-                return False
+        if 'text/html' in content_type and destination.endswith('.safetensors'):
+            logger.error(f"Received HTML instead of binary file. Download may have failed.")
+            return False
         
         # Save file in chunks
         downloaded_size = 0
-        logger.info("Starting file download...")
         with open(destination, 'wb') as f:
             for chunk in response.iter_content(chunk_size=32768):
                 if chunk:
                     f.write(chunk)
                     downloaded_size += len(chunk)
-                    # Log progress for large files
-                    if downloaded_size % (10 * 1024 * 1024) == 0:  # Every 10MB
-                        logger.info(f"Downloaded {downloaded_size / (1024*1024):.0f} MB...")
         
         file_size = os.path.getsize(destination)
-        logger.info(f"Successfully downloaded {destination} ({file_size / (1024*1024):.2f} MB)")
+        logger.info(f"Downloaded {destination} ({file_size / (1024*1024):.2f} MB)")
         
         # Verify file is not too small (likely an error page)
         if destination.endswith('.safetensors') and file_size < 1000000:  # Less than 1MB
@@ -195,8 +286,6 @@ def download_file_from_google_drive(file_id: str, destination: str) -> bool:
         
     except Exception as e:
         logger.error(f"Error downloading file: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
         return False
 
 def download_models() -> bool:
@@ -268,12 +357,7 @@ def download_models() -> bool:
             
             if file_id:
                 logger.info(f"Downloading {model_info['name']} using file ID: {file_id[:20]}...")
-                # Try gdown first if available
-                if GDOWN_AVAILABLE:
-                    success = download_file_from_google_drive_gdown(file_id, str(file_path))
-                else:
-                    success = download_file_from_google_drive(file_id, str(file_path))
-                
+                success = download_file_from_google_drive(file_id, str(file_path))
                 if not success:
                     logger.error(f"Failed to download {model_info['name']}")
                     all_successful = False
@@ -292,12 +376,7 @@ def download_models() -> bool:
                 
                 if extracted_id:
                     logger.info(f"Extracted file ID from URL: {extracted_id[:20]}...")
-                    # Try gdown first if available
-                    if GDOWN_AVAILABLE:
-                        success = download_file_from_google_drive_gdown(extracted_id, str(file_path))
-                    else:
-                        success = download_file_from_google_drive(extracted_id, str(file_path))
-                    
+                    success = download_file_from_google_drive(extracted_id, str(file_path))
                     if not success:
                         logger.error(f"Failed to download {model_info['name']}")
                         all_successful = False
@@ -348,10 +427,13 @@ async def lifespan(app: FastAPI):
         else:
             logger.error(f"[startup] Model files not found: ordinal={ordinal_path.exists()}, class={class_path.exists()}")
             
-        # Check dataset
+        # Check & load dataset for topic exploration
         if dataset_path.exists():
-            dataset_loaded = True
-            logger.info("[startup] Dataset file found")
+            logger.info("[startup] Dataset file found, attempting to load into memory")
+            if load_dataset() is not None:
+                logger.info("[startup] Dataset loaded successfully")
+            else:
+                logger.warning("[startup] Failed to load dataset into memory")
         else:
             logger.warning("[startup] Dataset file not found")
             
@@ -386,23 +468,16 @@ class AnalyzeRequest(BaseModel):
     title: str = Field(..., description="Article title")
     body: str = Field(..., description="Article body text")
 
-class AnalyzeUrlRequest(BaseModel):
-    url: str = Field(..., description="URL to analyze")
-
-class AnalyzeTextRequest(BaseModel):
-    title: str = Field(..., description="Article title")
-    body: str = Field(..., description="Article body text")
-
 class AnalyzeResponse(BaseModel):
     success: bool
     data: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
 class TopicRequest(BaseModel):
-    keyword: Optional[str] = Field(None, description="Keyword to search for")
-    topic: Optional[str] = Field(None, description="Topic to explore")
-    limit: Optional[int] = Field(3, description="Number of results to return")
-    label: Optional[str] = Field(None, description="Filter by framing label")
+    keyword: Optional[str] = Field(None, description="Keyword to search for in concept, title, and body")
+    topic: Optional[str] = Field(None, description="Topic to explore (alias for keyword)")
+    limit: Optional[int] = Field(3, description="Number of results to return (default: 3)")
+    label: Optional[str] = Field(None, description="Filter by framing label: NEUTRAL, LOADED, or ALARMIST")
     
     def get_topic(self) -> str:
         """Get the topic/keyword value, preferring keyword over topic"""
@@ -458,101 +533,23 @@ async def analyze_article(request: AnalyzeRequest):
         logger.error(f"Unexpected error: {str(e)}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/analyze/url")
-async def analyze_url(request: AnalyzeUrlRequest):
-    """Extract article from URL and analyze it"""
-    global analyzer
-    
-    if analyzer is None or not analyzer.is_initialized:
-        raise HTTPException(
-            status_code=503,
-            detail="Models not initialized. Please check server logs and ensure model files are available."
-        )
-    
-    try:
-        # Extract article from URL
-        logger.info(f"Extracting article from URL: {request.url}")
-        title, body, metadata = extract_article_from_url(request.url)
-        
-        # Analyze the article
-        logger.info(f"Analyzing extracted article: '{title[:50]}...'")
-        analysis_result = analyzer.analyze_article(title, body)
-        
-        # Format response for frontend
-        return {
-            "title": title,
-            "body": body,
-            "body_preview": body[:500] if len(body) > 500 else body,
-            "source": metadata.get("source", ""),
-            "source_url": metadata.get("source_url", request.url),
-            "publish_date": metadata.get("publish_date"),
-            "analysis": {
-                "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
-                "classification_analysis": analysis_result.get("classification_analysis", {})
-            },
-            "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
-            "classification_analysis": analysis_result.get("classification_analysis", {})
-        }
-    except ArticleExtractionError as e:
-        logger.error(f"Article extraction error: {str(e)}")
-        raise HTTPException(status_code=400, detail=str(e))
-    except ModelInferenceError as e:
-        logger.error(f"Inference error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
-@app.post("/analyze/text")
-async def analyze_text(request: AnalyzeTextRequest):
-    """Analyze manually provided text"""
-    global analyzer
-    
-    if analyzer is None or not analyzer.is_initialized:
-        raise HTTPException(
-            status_code=503,
-            detail="Models not initialized. Please check server logs and ensure model files are available."
-        )
-    
-    try:
-        # Analyze the article
-        logger.info(f"Analyzing text: '{request.title[:50]}...'")
-        analysis_result = analyzer.analyze_article(request.title, request.body)
-        
-        # Format response for frontend
-        return {
-            "title": request.title,
-            "body": request.body,
-            "body_preview": request.body[:500] if len(request.body) > 500 else request.body,
-            "analysis": {
-                "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
-                "classification_analysis": analysis_result.get("classification_analysis", {})
-            },
-            "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
-            "classification_analysis": analysis_result.get("classification_analysis", {})
-        }
-    except ModelInferenceError as e:
-        logger.error(f"Inference error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        raise HTTPException(status_code=500, detail="Internal server error")
-
 @app.post("/explore/topic")
 async def explore_topic(request: TopicRequest):
-    """Explore articles related to a topic using precomputed labels from the dataset.
-
-    IMPORTANT: This endpoint does NOT run the ML models. It relies entirely on the
-    labels/scores that were precomputed in the CSV dataset.
-    """
-    global dataset_loaded
-
+    """Explore articles related to a topic"""
+    global analyzer, dataset_loaded
+    
+    if analyzer is None or not analyzer.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Models not initialized"
+        )
+    
     if not dataset_loaded:
         raise HTTPException(
             status_code=503,
             detail="Dataset not loaded"
         )
-
+    
     topic = request.get_topic()
     if not topic:
         raise HTTPException(
@@ -560,159 +557,18 @@ async def explore_topic(request: TopicRequest):
             detail="Either 'keyword' or 'topic' must be provided"
         )
 
-    try:
-        import csv
-        base_dir = Path(__file__).parent.parent
-        dataset_path = base_dir / "Dataset-framing_annotations-Llama-3.3-70B-Instruct-Turbo.csv"
+    # Use the precomputed dataset for topic exploration
+    limit = request.limit or 3
+    label_filter = request.label
 
-        if not dataset_path.exists():
-            raise HTTPException(
-                status_code=503,
-                detail="Dataset file not found"
-            )
+    results = search_dataset(topic, limit=limit, label=label_filter)
 
-        logger.info(f"Streaming search of dataset {dataset_path} for '{topic}' (precomputed labels only)")
-        keyword_lower = topic.lower()
-        limit = request.limit or 3
-        label_filter = (request.label or "").strip().lower() or None
-
-        # Candidate columns for precomputed framing labels
-        label_column_candidates = [
-            "framing_label",
-            "framing",
-            "frame_label",
-            "predicted_label",
-            "label",
-            "class",
-            "category",
-        ]
-
-        results = []
-
-        with open(dataset_path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            fieldnames = reader.fieldnames or []
-
-            # Determine which column holds the precomputed framing label
-            label_col = None
-            for col in label_column_candidates:
-                if col in fieldnames:
-                    label_col = col
-                    logger.info(f"Using '{label_col}' as framing label column for topic search")
-                    break
-
-            for row in reader:
-                if len(results) >= limit:
-                    break
-
-                # Extract title and body text from common columns
-                title = ""
-                body = ""
-
-                for col in ["title", "headline"]:
-                    if col in fieldnames and row.get(col):
-                        title = str(row[col])
-                        break
-
-                for col in ["text", "body", "article_text", "content"]:
-                    if col in fieldnames and row.get(col):
-                        body = str(row[col])
-                        break
-
-                if not (title or body):
-                    continue
-
-                # Keyword match in title+body
-                text_for_match = f"{title} {body}".lower()
-                if keyword_lower not in text_for_match:
-                    continue
-
-                # Get precomputed label from dataset (if available)
-                dataset_label_raw = (row.get(label_col) if label_col else "") or ""
-                dataset_label_clean = dataset_label_raw.strip()
-                dataset_label_lower = dataset_label_clean.lower()
-
-                # Apply framing filter from frontend (neutral/loaded/alarmist)
-                if label_filter:
-                    # Map user label to canonical lowercase form
-                    allowed = {
-                        "neutral": ["neutral"],
-                        "loaded": ["loaded"],
-                        "alarmist": ["alarmist"],
-                    }.get(label_filter, [label_filter])
-
-                    if dataset_label_lower not in allowed:
-                        continue
-
-                # Normalize label to title case for display
-                if dataset_label_lower in ("neutral", "loaded", "alarmist"):
-                    normalized_label = dataset_label_lower.capitalize()
-                else:
-                    normalized_label = dataset_label_clean or "Neutral"
-
-                # Map label to class index (0: Neutral, 1: Loaded, 2: Alarmist)
-                label_to_index = {"neutral": 0, "loaded": 1, "alarmist": 2}
-                predicted_class = label_to_index.get(dataset_label_lower, 0)
-
-                # Build minimal analysis stubs from precomputed label
-                classification_analysis = {
-                    "model_type": "3-class-precomputed",
-                    "predicted_class": predicted_class,
-                    "predicted_label": normalized_label,
-                    "confidence": None,
-                    "all_probabilities": {
-                        "Neutral": None,
-                        "Loaded": None,
-                        "Alarmist": None,
-                    },
-                }
-
-                # For ordinal, we don't have precomputed scores here; reuse label only
-                ordinal_analysis = {
-                    "model_type": "ordinal-precomputed",
-                    "predicted_class": predicted_class,
-                    "predicted_label": normalized_label,
-                    "confidence": None,
-                    "scale_score": None,
-                    "all_probabilities": {
-                        "Neutral": None,
-                        "Loaded": None,
-                        "Alarmist": None,
-                    },
-                }
-
-                result = {
-                    "title": title or topic,
-                    "body": body,
-                    "body_preview": body[:500] if len(body) > 500 else body,
-                    "source": row.get("source", row.get("media_name", "")),
-                    "source_url": row.get("url", row.get("source_url", "")),
-                    "publish_date": row.get("publish_date") or None,
-                    "analysis": {
-                        "ordinal_analysis": ordinal_analysis,
-                        "classification_analysis": classification_analysis,
-                    },
-                    "ordinal_analysis": ordinal_analysis,
-                    "classification_analysis": classification_analysis,
-                }
-                results.append(result)
-
-        logger.info(f"Topic search for '{topic}' returning {len(results)} results (precomputed labels)")
-
-        return {
-            "success": True,
-            "topic": topic,
-            "results": results,
-        }
-
-    except Exception as e:
-        logger.error(f"Error searching dataset: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=500,
-            detail=f"Error searching dataset: {str(e)}",
-        )
+    return {
+        "success": True,
+        "topic": topic,
+        "results": results,
+        "count": len(results),
+    }
 
 @app.get("/model-info")
 async def get_model_info():
