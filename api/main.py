@@ -562,19 +562,129 @@ async def explore_topic(request: TopicRequest):
             detail="Either 'keyword' or 'topic' must be provided"
         )
     
-    # TODO: Implement topic exploration logic with dataset search
-    # For now, return a placeholder response that matches frontend expectations
-    limit = request.limit or 3
-    results = []
-    
-    # Placeholder: Return empty results array (frontend expects results array)
-    # In the future, this should search the dataset for articles matching the topic
-    return {
-        "success": True,
-        "topic": topic,
-        "results": results,
-        "message": "Topic exploration not yet implemented. This feature will search the dataset for articles matching your query."
-    }
+    try:
+        import pandas as pd
+        base_dir = Path(__file__).parent.parent
+        dataset_path = base_dir / "Dataset-framing_annotations-Llama-3.3-70B-Instruct-Turbo.csv"
+        
+        if not dataset_path.exists():
+            raise HTTPException(
+                status_code=503,
+                detail="Dataset file not found"
+            )
+        
+        # Load dataset
+        logger.info(f"Loading dataset from {dataset_path}")
+        df = pd.read_csv(dataset_path)
+        
+        # Search for articles matching the keyword
+        keyword_lower = topic.lower()
+        limit = request.limit or 3
+        
+        # Search in title and body columns (adjust column names based on your dataset)
+        # Common column names: title, text, body, article_text, content
+        search_columns = []
+        for col in ['title', 'text', 'body', 'article_text', 'content', 'headline']:
+            if col in df.columns:
+                search_columns.append(col)
+        
+        if not search_columns:
+            # If no standard columns found, use all string columns
+            search_columns = [col for col in df.columns if df[col].dtype == 'object']
+        
+        # Create a mask for matching rows
+        mask = pd.Series([False] * len(df))
+        for col in search_columns:
+            mask |= df[col].astype(str).str.lower().str.contains(keyword_lower, na=False)
+        
+        # Filter by label if provided
+        if request.label:
+            label_lower = request.label.lower()
+            # Common label column names
+            label_columns = ['label', 'framing', 'category', 'class', 'predicted_label']
+            label_col = None
+            for col in label_columns:
+                if col in df.columns:
+                    label_col = col
+                    break
+            
+            if label_col:
+                # Map frontend labels to dataset labels
+                label_mapping = {
+                    'neutral': 'Neutral',
+                    'loaded': 'Loaded',
+                    'alarmist': 'Alarmist'
+                }
+                dataset_label = label_mapping.get(label_lower, label_lower.capitalize())
+                mask &= df[label_col].astype(str).str.lower() == dataset_label.lower()
+        
+        # Get matching rows
+        matching_df = df[mask].head(limit)
+        
+        # Format results for frontend
+        results = []
+        for _, row in matching_df.iterrows():
+            # Extract title and body
+            title = ""
+            body = ""
+            
+            for col in ['title', 'headline']:
+                if col in row and pd.notna(row[col]):
+                    title = str(row[col])
+                    break
+            
+            for col in ['text', 'body', 'article_text', 'content']:
+                if col in row and pd.notna(row[col]):
+                    body = str(row[col])
+                    break
+            
+            # If we have title/body, analyze it
+            if title and body:
+                try:
+                    analysis_result = analyzer.analyze_article(title, body)
+                    result = {
+                        "title": title,
+                        "body": body,
+                        "body_preview": body[:500] if len(body) > 500 else body,
+                        "source": row.get('source', row.get('media_name', '')),
+                        "source_url": row.get('url', row.get('source_url', '')),
+                        "publish_date": str(row.get('publish_date', '')) if pd.notna(row.get('publish_date', '')) else None,
+                        "analysis": {
+                            "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
+                            "classification_analysis": analysis_result.get("classification_analysis", {})
+                        },
+                        "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
+                        "classification_analysis": analysis_result.get("classification_analysis", {})
+                    }
+                    results.append(result)
+                except Exception as e:
+                    logger.warning(f"Failed to analyze article: {str(e)}")
+                    # Still add the result without analysis
+                    result = {
+                        "title": title,
+                        "body": body[:500] if len(body) > 500 else body,
+                        "source": row.get('source', row.get('media_name', '')),
+                        "source_url": row.get('url', row.get('source_url', '')),
+                        "publish_date": str(row.get('publish_date', '')) if pd.notna(row.get('publish_date', '')) else None,
+                    }
+                    results.append(result)
+        
+        logger.info(f"Found {len(results)} articles matching '{topic}'")
+        
+        return {
+            "success": True,
+            "topic": topic,
+            "results": results
+        }
+        
+    except Exception as e:
+        logger.error(f"Error searching dataset: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error searching dataset: {str(e)}"
+        )
 
 @app.get("/model-info")
 async def get_model_info():
