@@ -573,53 +573,74 @@ async def explore_topic(request: TopicRequest):
                 detail="Dataset file not found"
             )
         
-        # Load dataset
-        logger.info(f"Loading dataset from {dataset_path}")
-        df = pd.read_csv(dataset_path)
-        
-        # Search for articles matching the keyword
+        # Memory-efficient search: read CSV in chunks
+        logger.info(f"Searching dataset from {dataset_path} for '{topic}'")
         keyword_lower = topic.lower()
         limit = request.limit or 3
         
-        # Search in title and body columns (adjust column names based on your dataset)
-        # Common column names: title, text, body, article_text, content
+        # First, read just the header to identify columns
+        sample_df = pd.read_csv(dataset_path, nrows=1)
+        
+        # Identify search columns
         search_columns = []
         for col in ['title', 'text', 'body', 'article_text', 'content', 'headline']:
-            if col in df.columns:
+            if col in sample_df.columns:
                 search_columns.append(col)
         
         if not search_columns:
             # If no standard columns found, use all string columns
-            search_columns = [col for col in df.columns if df[col].dtype == 'object']
+            search_columns = [col for col in sample_df.columns if sample_df[col].dtype == 'object']
         
-        # Create a mask for matching rows
-        mask = pd.Series([False] * len(df))
-        for col in search_columns:
-            mask |= df[col].astype(str).str.lower().str.contains(keyword_lower, na=False)
-        
-        # Filter by label if provided
+        # Identify label column
+        label_col = None
         if request.label:
-            label_lower = request.label.lower()
-            # Common label column names
             label_columns = ['label', 'framing', 'category', 'class', 'predicted_label']
-            label_col = None
             for col in label_columns:
-                if col in df.columns:
+                if col in sample_df.columns:
                     label_col = col
                     break
+        
+        # Read CSV in chunks to save memory
+        chunk_size = 1000  # Process 1000 rows at a time
+        matching_rows = []
+        found_count = 0
+        
+        logger.info(f"Searching in columns: {search_columns}")
+        
+        for chunk in pd.read_csv(dataset_path, chunksize=chunk_size, low_memory=False):
+            if found_count >= limit:
+                break
             
-            if label_col:
-                # Map frontend labels to dataset labels
+            # Create a mask for matching rows in this chunk
+            mask = pd.Series([False] * len(chunk))
+            for col in search_columns:
+                if col in chunk.columns:
+                    mask |= chunk[col].astype(str).str.lower().str.contains(keyword_lower, na=False)
+            
+            # Filter by label if provided
+            if request.label and label_col and label_col in chunk.columns:
+                label_lower = request.label.lower()
                 label_mapping = {
                     'neutral': 'Neutral',
                     'loaded': 'Loaded',
                     'alarmist': 'Alarmist'
                 }
                 dataset_label = label_mapping.get(label_lower, label_lower.capitalize())
-                mask &= df[label_col].astype(str).str.lower() == dataset_label.lower()
+                mask &= chunk[label_col].astype(str).str.lower() == dataset_label.lower()
+            
+            # Get matching rows from this chunk
+            chunk_matches = chunk[mask]
+            for _, row in chunk_matches.iterrows():
+                if found_count >= limit:
+                    break
+                matching_rows.append(row)
+                found_count += 1
         
-        # Get matching rows
-        matching_df = df[mask].head(limit)
+        # Convert to DataFrame for easier processing
+        if matching_rows:
+            matching_df = pd.DataFrame(matching_rows)
+        else:
+            matching_df = pd.DataFrame()
         
         # Format results for frontend
         results = []
