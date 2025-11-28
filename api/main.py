@@ -1,5 +1,6 @@
 """
 FastAPI backend for EthoScore Article Analysis
+Version: 2.1.0 - Fixed gdown download for virus scan bypass
 """
 
 import os
@@ -482,7 +483,7 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     global analyzer, dataset_loaded
     
-    logger.info("[startup] Starting EthoScore API...")
+    logger.info("[startup] Starting EthoScore API v2.1.0 (gdown fix)...")
     
     # Try to download models
     logger.info("[startup] Checking for model files...")
