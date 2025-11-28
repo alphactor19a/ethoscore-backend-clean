@@ -600,12 +600,25 @@ async def explore_topic(request: TopicRequest):
                     label_col = col
                     break
         
-        # Read CSV in chunks to save memory
-        chunk_size = 1000  # Process 1000 rows at a time
+        # Read CSV in chunks to save memory - using larger chunks for better performance
+        # 50k rows per chunk (about 50% of 125k articles as requested, but in chunks for memory safety)
+        chunk_size = 50000  # Process 50k rows at a time for much better performance
         matching_rows = []
         found_count = 0
         
-        logger.info(f"Searching in columns: {search_columns}")
+        logger.info(f"Searching in columns: {search_columns} with chunk size {chunk_size}")
+        
+        # Prepare label filter if needed
+        label_filter_value = None
+        if request.label and label_col:
+            label_lower = request.label.lower()
+            label_mapping = {
+                'neutral': 'Neutral',
+                'loaded': 'Loaded',
+                'alarmist': 'Alarmist'
+            }
+            label_filter_value = label_mapping.get(label_lower, label_lower.capitalize())
+            logger.info(f"Filtering by label: {label_filter_value}")
         
         for chunk in pd.read_csv(dataset_path, chunksize=chunk_size, low_memory=False):
             if found_count >= limit:
@@ -617,19 +630,20 @@ async def explore_topic(request: TopicRequest):
                 if col in chunk.columns:
                     mask |= chunk[col].astype(str).str.lower().str.contains(keyword_lower, na=False)
             
-            # Filter by label if provided
-            if request.label and label_col and label_col in chunk.columns:
-                label_lower = request.label.lower()
-                label_mapping = {
-                    'neutral': 'Neutral',
-                    'loaded': 'Loaded',
-                    'alarmist': 'Alarmist'
-                }
-                dataset_label = label_mapping.get(label_lower, label_lower.capitalize())
-                mask &= chunk[label_col].astype(str).str.lower() == dataset_label.lower()
+            # Filter by label if provided - FIXED: check exact match properly
+            if label_filter_value and label_col and label_col in chunk.columns:
+                # Convert to string, strip whitespace, and compare case-insensitively
+                chunk_labels = chunk[label_col].astype(str).str.strip().str.lower()
+                label_filter_lower = label_filter_value.lower().strip()
+                label_mask = chunk_labels == label_filter_lower
+                # Apply label filter to the search mask
+                mask = mask & label_mask
+                logger.info(f"Label filter: {sum(label_mask)} rows match '{label_filter_value}' in this chunk (before keyword filter: {sum(mask)})")
             
             # Get matching rows from this chunk
             chunk_matches = chunk[mask]
+            logger.info(f"Found {len(chunk_matches)} matches in this chunk (total found so far: {found_count})")
+            
             for _, row in chunk_matches.iterrows():
                 if found_count >= limit:
                     break
