@@ -399,7 +399,14 @@ class AnalyzeResponse(BaseModel):
     error: Optional[str] = None
 
 class TopicRequest(BaseModel):
-    topic: str = Field(..., description="Topic to explore")
+    keyword: Optional[str] = Field(None, description="Keyword to search for")
+    topic: Optional[str] = Field(None, description="Topic to explore")
+    limit: Optional[int] = Field(3, description="Number of results to return")
+    label: Optional[str] = Field(None, description="Filter by framing label")
+    
+    def get_topic(self) -> str:
+        """Get the topic/keyword value, preferring keyword over topic"""
+        return self.keyword or self.topic or ""
 
 class HealthResponse(BaseModel):
     ok: bool
@@ -548,12 +555,25 @@ async def explore_topic(request: TopicRequest):
             detail="Dataset not loaded"
         )
     
-    # TODO: Implement topic exploration logic
-    # For now, return a placeholder response
+    topic = request.get_topic()
+    if not topic:
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'keyword' or 'topic' must be provided"
+        )
+    
+    # TODO: Implement topic exploration logic with dataset search
+    # For now, return a placeholder response that matches frontend expectations
+    limit = request.limit or 3
+    results = []
+    
+    # Placeholder: Return empty results array (frontend expects results array)
+    # In the future, this should search the dataset for articles matching the topic
     return {
         "success": True,
-        "topic": request.topic,
-        "message": "Topic exploration not yet implemented"
+        "topic": topic,
+        "results": results,
+        "message": "Topic exploration not yet implemented. This feature will search the dataset for articles matching your query."
     }
 
 @app.get("/model-info")
