@@ -563,7 +563,7 @@ async def explore_topic(request: TopicRequest):
         )
     
     try:
-        import pandas as pd
+        import csv
         base_dir = Path(__file__).parent.parent
         dataset_path = base_dir / "Dataset-framing_annotations-Llama-3.3-70B-Instruct-Turbo.csv"
         
@@ -573,117 +573,63 @@ async def explore_topic(request: TopicRequest):
                 detail="Dataset file not found"
             )
         
-        # Memory-efficient search: read CSV in chunks
-        logger.info(f"Searching dataset from {dataset_path} for '{topic}'")
+        logger.info(f"Streaming search of dataset {dataset_path} for '{topic}'")
         keyword_lower = topic.lower()
         limit = request.limit or 3
+        label_filter = (request.label or "").strip().lower() or None
         
-        # First, read just the header to identify columns
-        sample_df = pd.read_csv(dataset_path, nrows=1)
-        
-        # Identify search columns
-        search_columns = []
-        for col in ['title', 'text', 'body', 'article_text', 'content', 'headline']:
-            if col in sample_df.columns:
-                search_columns.append(col)
-        
-        if not search_columns:
-            # If no standard columns found, use all string columns
-            search_columns = [col for col in sample_df.columns if sample_df[col].dtype == 'object']
-        
-        # Identify label column
-        label_col = None
-        if request.label:
-            label_columns = ['label', 'framing', 'category', 'class', 'predicted_label']
-            for col in label_columns:
-                if col in sample_df.columns:
-                    label_col = col
-                    break
-        
-        # Read CSV in chunks to save memory - using larger chunks for better performance
-        # 50k rows per chunk (about 50% of 125k articles as requested, but in chunks for memory safety)
-        chunk_size = 50000  # Process 50k rows at a time for much better performance
-        matching_rows = []
-        found_count = 0
-        
-        logger.info(f"Searching in columns: {search_columns} with chunk size {chunk_size}")
-        
-        # Prepare label filter if needed
-        label_filter_value = None
-        if request.label and label_col:
-            label_lower = request.label.lower()
-            label_mapping = {
-                'neutral': 'Neutral',
-                'loaded': 'Loaded',
-                'alarmist': 'Alarmist'
-            }
-            label_filter_value = label_mapping.get(label_lower, label_lower.capitalize())
-            logger.info(f"Filtering by label: {label_filter_value}")
-        
-        for chunk in pd.read_csv(dataset_path, chunksize=chunk_size, low_memory=False):
-            if found_count >= limit:
-                break
-            
-            # Create a mask for matching rows in this chunk
-            mask = pd.Series([False] * len(chunk))
-            for col in search_columns:
-                if col in chunk.columns:
-                    mask |= chunk[col].astype(str).str.lower().str.contains(keyword_lower, na=False)
-            
-            # Filter by label if provided - FIXED: check exact match properly
-            if label_filter_value and label_col and label_col in chunk.columns:
-                # Convert to string, strip whitespace, and compare case-insensitively
-                chunk_labels = chunk[label_col].astype(str).str.strip().str.lower()
-                label_filter_lower = label_filter_value.lower().strip()
-                label_mask = chunk_labels == label_filter_lower
-                # Apply label filter to the search mask
-                mask = mask & label_mask
-                logger.info(f"Label filter: {sum(label_mask)} rows match '{label_filter_value}' in this chunk (before keyword filter: {sum(mask)})")
-            
-            # Get matching rows from this chunk
-            chunk_matches = chunk[mask]
-            logger.info(f"Found {len(chunk_matches)} matches in this chunk (total found so far: {found_count})")
-            
-            for _, row in chunk_matches.iterrows():
-                if found_count >= limit:
-                    break
-                matching_rows.append(row)
-                found_count += 1
-        
-        # Convert to DataFrame for easier processing
-        if matching_rows:
-            matching_df = pd.DataFrame(matching_rows)
-        else:
-            matching_df = pd.DataFrame()
-        
-        # Format results for frontend
         results = []
-        for _, row in matching_df.iterrows():
-            # Extract title and body
-            title = ""
-            body = ""
+        
+        with open(dataset_path, "r", encoding="utf-8", newline="") as f:
+            reader = csv.DictReader(f)
             
-            for col in ['title', 'headline']:
-                if col in row and pd.notna(row[col]):
-                    title = str(row[col])
+            for row in reader:
+                # Stop once we have enough results
+                if len(results) >= limit:
                     break
-            
-            for col in ['text', 'body', 'article_text', 'content']:
-                if col in row and pd.notna(row[col]):
-                    body = str(row[col])
-                    break
-            
-            # If we have title/body, analyze it
-            if title and body:
+                
+                # Extract title and body text from common columns
+                title = ""
+                body = ""
+                
+                for col in ["title", "headline"]:
+                    if col in reader.fieldnames and row.get(col):
+                        title = str(row[col])
+                        break
+                
+                for col in ["text", "body", "article_text", "content"]:
+                    if col in reader.fieldnames and row.get(col):
+                        body = str(row[col])
+                        break
+                
+                if not (title or body):
+                    continue
+                
+                text_for_match = f"{title} {body}".lower()
+                if keyword_lower not in text_for_match:
+                    continue
+                
                 try:
+                    # Run the analyzer
                     analysis_result = analyzer.analyze_article(title, body)
+                    
+                    # If a framing filter is set, filter by predicted label
+                    if label_filter:
+                        pred_label = (
+                            analysis_result.get("classification_analysis", {}).get("predicted_label")
+                            or analysis_result.get("ordinal_analysis", {}).get("predicted_label")
+                            or ""
+                        )
+                        if pred_label.strip().lower() != label_filter:
+                            continue
+                    
                     result = {
                         "title": title,
                         "body": body,
                         "body_preview": body[:500] if len(body) > 500 else body,
-                        "source": row.get('source', row.get('media_name', '')),
-                        "source_url": row.get('url', row.get('source_url', '')),
-                        "publish_date": str(row.get('publish_date', '')) if pd.notna(row.get('publish_date', '')) else None,
+                        "source": row.get("source", row.get("media_name", "")),
+                        "source_url": row.get("url", row.get("source_url", "")),
+                        "publish_date": row.get("publish_date") or None,
                         "analysis": {
                             "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
                             "classification_analysis": analysis_result.get("classification_analysis", {})
@@ -693,25 +639,17 @@ async def explore_topic(request: TopicRequest):
                     }
                     results.append(result)
                 except Exception as e:
-                    logger.warning(f"Failed to analyze article: {str(e)}")
-                    # Still add the result without analysis
-                    result = {
-                        "title": title,
-                        "body": body[:500] if len(body) > 500 else body,
-                        "source": row.get('source', row.get('media_name', '')),
-                        "source_url": row.get('url', row.get('source_url', '')),
-                        "publish_date": str(row.get('publish_date', '')) if pd.notna(row.get('publish_date', '')) else None,
-                    }
-                    results.append(result)
+                    logger.warning(f"Failed to analyze article during topic search: {str(e)}")
+                    continue
         
-        logger.info(f"Found {len(results)} articles matching '{topic}'")
+        logger.info(f"Topic search for '{topic}' returning {len(results)} results")
         
         return {
             "success": True,
             "topic": topic,
             "results": results
         }
-        
+    
     except Exception as e:
         logger.error(f"Error searching dataset: {str(e)}")
         import traceback
