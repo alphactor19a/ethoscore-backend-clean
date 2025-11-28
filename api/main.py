@@ -25,6 +25,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.model_analyzer import ArticleFramingAnalyzer, ModelLoadingError, ModelInferenceError
+from src.article_processor import extract_article_from_url, ArticleExtractionError
 
 # Set up logging
 logging.basicConfig(
@@ -385,6 +386,13 @@ class AnalyzeRequest(BaseModel):
     title: str = Field(..., description="Article title")
     body: str = Field(..., description="Article body text")
 
+class AnalyzeUrlRequest(BaseModel):
+    url: str = Field(..., description="URL to analyze")
+
+class AnalyzeTextRequest(BaseModel):
+    title: str = Field(..., description="Article title")
+    body: str = Field(..., description="Article body text")
+
 class AnalyzeResponse(BaseModel):
     success: bool
     data: Optional[Dict[str, Any]] = None
@@ -436,6 +444,86 @@ async def analyze_article(request: AnalyzeRequest):
     try:
         result = analyzer.analyze_article(request.title, request.body)
         return AnalyzeResponse(success=True, data=result)
+    except ModelInferenceError as e:
+        logger.error(f"Inference error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/analyze/url")
+async def analyze_url(request: AnalyzeUrlRequest):
+    """Extract article from URL and analyze it"""
+    global analyzer
+    
+    if analyzer is None or not analyzer.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Models not initialized. Please check server logs and ensure model files are available."
+        )
+    
+    try:
+        # Extract article from URL
+        logger.info(f"Extracting article from URL: {request.url}")
+        title, body, metadata = extract_article_from_url(request.url)
+        
+        # Analyze the article
+        logger.info(f"Analyzing extracted article: '{title[:50]}...'")
+        analysis_result = analyzer.analyze_article(title, body)
+        
+        # Format response for frontend
+        return {
+            "title": title,
+            "body": body,
+            "body_preview": body[:500] if len(body) > 500 else body,
+            "source": metadata.get("source", ""),
+            "source_url": metadata.get("source_url", request.url),
+            "publish_date": metadata.get("publish_date"),
+            "analysis": {
+                "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
+                "classification_analysis": analysis_result.get("classification_analysis", {})
+            },
+            "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
+            "classification_analysis": analysis_result.get("classification_analysis", {})
+        }
+    except ArticleExtractionError as e:
+        logger.error(f"Article extraction error: {str(e)}")
+        raise HTTPException(status_code=400, detail=str(e))
+    except ModelInferenceError as e:
+        logger.error(f"Inference error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.post("/analyze/text")
+async def analyze_text(request: AnalyzeTextRequest):
+    """Analyze manually provided text"""
+    global analyzer
+    
+    if analyzer is None or not analyzer.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Models not initialized. Please check server logs and ensure model files are available."
+        )
+    
+    try:
+        # Analyze the article
+        logger.info(f"Analyzing text: '{request.title[:50]}...'")
+        analysis_result = analyzer.analyze_article(request.title, request.body)
+        
+        # Format response for frontend
+        return {
+            "title": request.title,
+            "body": request.body,
+            "body_preview": request.body[:500] if len(request.body) > 500 else request.body,
+            "analysis": {
+                "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
+                "classification_analysis": analysis_result.get("classification_analysis", {})
+            },
+            "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
+            "classification_analysis": analysis_result.get("classification_analysis", {})
+        }
     except ModelInferenceError as e:
         logger.error(f"Inference error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
