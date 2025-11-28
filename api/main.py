@@ -1,6 +1,6 @@
 """
 FastAPI backend for EthoScore Article Analysis
-Version: 2.1.0 - Fixed gdown download for virus scan bypass
+Version: 2.2.0 - Memory-efficient streaming CSV search (no pandas load)
 """
 
 import os
@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 
-import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -39,179 +38,151 @@ logger = logging.getLogger(__name__)
 # Global analyzer and dataset instances
 analyzer: Optional[ArticleFramingAnalyzer] = None
 dataset_loaded: bool = False
-_dataset_df: Optional[pd.DataFrame] = None
 _dataset_path: Optional[Path] = None
 
 
-def load_dataset() -> Optional[pd.DataFrame]:
+def check_dataset_exists() -> bool:
     """
-    Load the framing annotations dataset into memory (cached global DataFrame).
+    Check if the dataset file exists (without loading it into memory).
     """
-    global _dataset_df, dataset_loaded, _dataset_path
+    global dataset_loaded, _dataset_path
 
     base_dir = Path(__file__).parent.parent
     dataset_path = base_dir / "Dataset-framing_annotations-Llama-3.3-70B-Instruct-Turbo.csv"
     _dataset_path = dataset_path
 
-    if _dataset_df is not None:
-        return _dataset_df
-
-    if not dataset_path.exists():
+    if dataset_path.exists():
+        file_size = dataset_path.stat().st_size / (1024 * 1024)  # Size in MB
+        logger.info(f"Dataset file found: {dataset_path} ({file_size:.1f} MB)")
+        dataset_loaded = True
+        return True
+    else:
         logger.warning(f"Dataset file not found at {dataset_path}")
         dataset_loaded = False
-        return None
-
-    try:
-        logger.info(f"Loading dataset for topic exploration from {dataset_path}...")
-        df = pd.read_csv(dataset_path)
-        logger.info(
-            f"Loaded dataset with {len(df)} rows and {len(df.columns)} columns: {list(df.columns)}"
-        )
-        _dataset_df = df
-        dataset_loaded = True
-        return _dataset_df
-    except Exception as e:
-        logger.error(f"Failed to load dataset from {dataset_path}: {e}")
-        dataset_loaded = False
-        _dataset_df = None
-        return None
+        return False
 
 
-def _choose_column(columns: List[str], keywords: List[str]) -> Optional[str]:
-    """
-    Pick the first column whose name contains any of the given keywords.
-    """
-    lowered = [c.lower() for c in columns]
-    for kw in keywords:
-        for col, lower_name in zip(columns, lowered):
-            if kw in lower_name:
-                return col
-    return None
-
-
-def search_dataset(
+def search_dataset_streaming(
     topic: str,
     limit: int = 3,
     label: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Search the precomputed dataset for rows matching the topic (and optional label).
-
-    Uses the specific dataset schema from the Llama-3.3 annotated dataset:
-    - 'concept' column: topic category (primary search target)
-    - 'title' column: article title (secondary search)
-    - 'body' column: article body text (secondary search)  
-    - 'FRAMING_CLASS' column: framing label (NEUTRAL, LOADED, ALARMIST)
-    - 'source' column: source information
+    Search the dataset using streaming CSV reading (memory efficient).
+    
+    Uses chunked reading to avoid loading the entire 810MB file into memory.
+    Searches in concept, title, and body columns.
+    Filters by FRAMING_CLASS if label is provided.
     """
-    global _dataset_df, _dataset_path
+    import csv
+    global _dataset_path
 
     if not topic:
         return []
 
-    if _dataset_df is None:
-        df = load_dataset()
-    else:
-        df = _dataset_df
-
-    if df is None or df.empty:
-        logger.warning("Dataset is not loaded or is empty; topic search cannot proceed")
-        return []
+    if _dataset_path is None or not _dataset_path.exists():
+        if not check_dataset_exists():
+            logger.warning("Dataset not available for topic search")
+            return []
 
     topic_str = str(topic).strip()
     topic_lower = topic_str.lower()
+    label_upper = str(label).strip().upper() if label else None
 
-    dataset_display_path = str(_dataset_path) if _dataset_path is not None else "<in-memory>"
-    logger.info(
-        f"Searching dataset {dataset_display_path} for topic '{topic_str}'"
-    )
-
-    # Build topic filter mask - search in concept, title, and body columns
-    mask = pd.Series(False, index=df.index)
-    
-    # Primary: Search in 'concept' column (topic category)
-    if 'concept' in df.columns:
-        concept_match = df['concept'].astype(str).str.contains(topic_lower, case=False, na=False)
-        mask |= concept_match
-        logger.info(f"Found {concept_match.sum()} matches in 'concept' column")
-    
-    # Secondary: Search in 'title' column
-    if 'title' in df.columns:
-        title_match = df['title'].astype(str).str.contains(topic_lower, case=False, na=False)
-        mask |= title_match
-        logger.info(f"Found {title_match.sum()} matches in 'title' column")
-    
-    # Secondary: Search in 'body' column
-    if 'body' in df.columns:
-        body_match = df['body'].astype(str).str.contains(topic_lower, case=False, na=False)
-        mask |= body_match
-        logger.info(f"Found {body_match.sum()} matches in 'body' column")
-
-    # Apply framing label filter using FRAMING_CLASS column
-    if label:
-        label_upper = str(label).strip().upper()
-        if 'FRAMING_CLASS' in df.columns:
-            label_mask = df['FRAMING_CLASS'].astype(str).str.upper() == label_upper
-            mask &= label_mask
-            logger.info(f"Applied FRAMING_CLASS filter: '{label_upper}'")
-        else:
-            logger.warning("'FRAMING_CLASS' column not found in dataset")
-
-    filtered = df[mask]
-    
-    if filtered.empty:
-        logger.info(f"Topic search for '{topic_str}' returning 0 results")
-        return []
-
-    logger.info(f"Found {len(filtered)} total matches, returning top {limit}")
+    logger.info(f"Streaming search for topic '{topic_str}'" + (f" with label '{label_upper}'" if label_upper else ""))
 
     results: List[Dict[str, Any]] = []
 
-    for _, row in filtered.head(limit).iterrows():
-        record: Dict[str, Any] = {}
+    try:
+        with open(_dataset_path, 'r', encoding='utf-8', newline='') as f:
+            reader = csv.DictReader(f)
+            
+            for row in reader:
+                if len(results) >= limit:
+                    break
 
-        # Title
-        if 'title' in df.columns and pd.notna(row.get('title')):
-            record["title"] = str(row['title']).strip()
-        else:
-            record["title"] = topic_str
+                # Check if topic matches in concept, title, or body
+                concept = str(row.get('concept', '')).lower()
+                title = str(row.get('title', '')).lower()
+                body = str(row.get('body', '')).lower()
+                
+                topic_match = (
+                    topic_lower in concept or 
+                    topic_lower in title or 
+                    topic_lower in body
+                )
+                
+                if not topic_match:
+                    continue
 
-        # Body preview
-        if 'body' in df.columns and pd.notna(row.get('body')):
-            body_text = str(row['body'])
-            record["body_preview"] = body_text[:2000]
+                # Check framing label filter if provided
+                if label_upper:
+                    framing_class = str(row.get('FRAMING_CLASS', '')).strip().upper()
+                    if framing_class != label_upper:
+                        continue
 
-        # Source - handle both string and dict formats
-        if 'source' in df.columns and pd.notna(row.get('source')):
-            source_val = row['source']
-            if isinstance(source_val, dict):
-                record["source"] = source_val.get('title') or source_val.get('uri', str(source_val))
-            else:
-                record["source"] = str(source_val)
+                # Build result record
+                record: Dict[str, Any] = {}
+                
+                # Title
+                raw_title = row.get('title', '').strip()
+                record["title"] = raw_title if raw_title else topic_str
+                
+                # Body preview (first 2000 chars)
+                raw_body = row.get('body', '')
+                if raw_body:
+                    record["body_preview"] = raw_body[:2000]
+                
+                # Source
+                raw_source = row.get('source', '')
+                if raw_source:
+                    # Handle if source is a JSON string (dict format)
+                    if raw_source.startswith('{'):
+                        try:
+                            import json
+                            source_dict = json.loads(raw_source.replace("'", '"'))
+                            record["source"] = source_dict.get('title') or source_dict.get('uri', raw_source)
+                        except:
+                            record["source"] = raw_source
+                    else:
+                        record["source"] = raw_source
+                
+                # Concept/topic category
+                raw_concept = row.get('concept', '').strip()
+                if raw_concept:
+                    record["concept"] = raw_concept
+                
+                # URL if available
+                raw_url = row.get('url', '').strip()
+                if raw_url:
+                    record["source_url"] = raw_url
+                
+                # Framing label
+                framing_class = row.get('FRAMING_CLASS', '').strip()
+                if framing_class:
+                    framing_label_display = framing_class.title()
+                    record["ordinal_analysis"] = {"predicted_label": framing_label_display}
+                    record["classification_analysis"] = {"predicted_label": framing_label_display}
+                    record["framing_class"] = framing_label_display
+                
+                results.append(record)
 
-        # Concept/topic category
-        if 'concept' in df.columns and pd.notna(row.get('concept')):
-            record["concept"] = str(row['concept'])
+        logger.info(f"Topic search for '{topic_str}' returning {len(results)} results (limit={limit})")
+        return results
 
-        # URL if available
-        if 'url' in df.columns and pd.notna(row.get('url')):
-            record["source_url"] = str(row['url'])
+    except Exception as e:
+        logger.error(f"Error during streaming search: {e}")
+        return []
 
-        # Framing label from FRAMING_CLASS column
-        if 'FRAMING_CLASS' in df.columns and pd.notna(row.get('FRAMING_CLASS')):
-            framing_label = str(row['FRAMING_CLASS']).strip()
-            # Normalize to title case for display
-            framing_label_display = framing_label.title()
-            record["ordinal_analysis"] = {"predicted_label": framing_label_display}
-            record["classification_analysis"] = {"predicted_label": framing_label_display}
-            record["framing_class"] = framing_label_display
 
-        results.append(record)
-
-    logger.info(
-        f"Topic search for '{topic_str}' returning {len(results)} results (limit={limit})"
-    )
-    return results
+# Alias for backward compatibility
+def search_dataset(
+    topic: str,
+    limit: int = 3,
+    label: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Search dataset using memory-efficient streaming."""
+    return search_dataset_streaming(topic, limit, label)
 
 def download_file_from_google_drive_gdown(file_id: str, destination: str) -> bool:
     """
@@ -483,7 +454,7 @@ async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events"""
     global analyzer, dataset_loaded
     
-    logger.info("[startup] Starting EthoScore API v2.1.0 (gdown fix)...")
+    logger.info("[startup] Starting EthoScore API v2.2.0 (memory-efficient streaming)...")
     
     # Try to download models
     logger.info("[startup] Checking for model files...")
@@ -511,13 +482,11 @@ async def lifespan(app: FastAPI):
         else:
             logger.error(f"[startup] Model files not found: ordinal={ordinal_path.exists()}, class={class_path.exists()}")
             
-        # Check & load dataset for topic exploration
+        # Check dataset exists (don't load into memory - use streaming search)
         if dataset_path.exists():
-            logger.info("[startup] Dataset file found, attempting to load into memory")
-            if load_dataset() is not None:
-                logger.info("[startup] Dataset loaded successfully")
-            else:
-                logger.warning("[startup] Failed to load dataset into memory")
+            file_size = dataset_path.stat().st_size / (1024 * 1024)
+            logger.info(f"[startup] Dataset file found ({file_size:.1f} MB) - will use streaming search")
+            check_dataset_exists()
         else:
             logger.warning("[startup] Dataset file not found")
             
