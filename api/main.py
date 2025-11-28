@@ -13,6 +13,13 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+try:
+    import gdown
+    GDOWN_AVAILABLE = True
+except ImportError:
+    GDOWN_AVAILABLE = False
+    logging.warning("gdown not available, will use fallback method")
+
 # Import our model analyzer
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -29,6 +36,51 @@ logger = logging.getLogger(__name__)
 # Global analyzer instance
 analyzer: Optional[ArticleFramingAnalyzer] = None
 dataset_loaded = False
+
+def download_file_from_google_drive_gdown(file_id: str, destination: str) -> bool:
+    """
+    Download a file from Google Drive using gdown library (handles virus scan automatically).
+    
+    Args:
+        file_id: Google Drive file ID
+        destination: Local file path to save to
+        
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        logger.info(f"Downloading with gdown: {file_id} -> {destination}")
+        
+        # gdown URL format
+        url = f"https://drive.google.com/uc?id={file_id}"
+        
+        # Download with gdown (it handles virus scan automatically)
+        output = gdown.download(url, destination, quiet=False, fuzzy=True)
+        
+        if output is None:
+            logger.error("gdown returned None - download failed")
+            return False
+        
+        # Verify file exists and has reasonable size
+        if not os.path.exists(destination):
+            logger.error(f"File not found after download: {destination}")
+            return False
+        
+        file_size = os.path.getsize(destination)
+        logger.info(f"Successfully downloaded with gdown: {destination} ({file_size / (1024*1024):.2f} MB)")
+        
+        # Verify file is not too small (likely an error)
+        if destination.endswith('.safetensors') and file_size < 1000000:  # Less than 1MB
+            logger.error(f"Downloaded file is suspiciously small ({file_size} bytes)")
+            return False
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error downloading with gdown: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return False
 
 def download_file_from_google_drive(file_id: str, destination: str) -> bool:
     """
@@ -215,7 +267,12 @@ def download_models() -> bool:
             
             if file_id:
                 logger.info(f"Downloading {model_info['name']} using file ID: {file_id[:20]}...")
-                success = download_file_from_google_drive(file_id, str(file_path))
+                # Try gdown first if available
+                if GDOWN_AVAILABLE:
+                    success = download_file_from_google_drive_gdown(file_id, str(file_path))
+                else:
+                    success = download_file_from_google_drive(file_id, str(file_path))
+                
                 if not success:
                     logger.error(f"Failed to download {model_info['name']}")
                     all_successful = False
@@ -234,7 +291,12 @@ def download_models() -> bool:
                 
                 if extracted_id:
                     logger.info(f"Extracted file ID from URL: {extracted_id[:20]}...")
-                    success = download_file_from_google_drive(extracted_id, str(file_path))
+                    # Try gdown first if available
+                    if GDOWN_AVAILABLE:
+                        success = download_file_from_google_drive_gdown(extracted_id, str(file_path))
+                    else:
+                        success = download_file_from_google_drive(extracted_id, str(file_path))
+                    
                     if not success:
                         logger.error(f"Failed to download {model_info['name']}")
                         all_successful = False
