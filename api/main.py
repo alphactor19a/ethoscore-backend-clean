@@ -540,123 +540,178 @@ async def analyze_text(request: AnalyzeTextRequest):
 
 @app.post("/explore/topic")
 async def explore_topic(request: TopicRequest):
-    """Explore articles related to a topic"""
-    global analyzer, dataset_loaded
-    
-    if analyzer is None or not analyzer.is_initialized:
-        raise HTTPException(
-            status_code=503,
-            detail="Models not initialized"
-        )
-    
+    """Explore articles related to a topic using precomputed labels from the dataset.
+
+    IMPORTANT: This endpoint does NOT run the ML models. It relies entirely on the
+    labels/scores that were precomputed in the CSV dataset.
+    """
+    global dataset_loaded
+
     if not dataset_loaded:
         raise HTTPException(
             status_code=503,
             detail="Dataset not loaded"
         )
-    
+
     topic = request.get_topic()
     if not topic:
         raise HTTPException(
             status_code=400,
             detail="Either 'keyword' or 'topic' must be provided"
         )
-    
+
     try:
         import csv
         base_dir = Path(__file__).parent.parent
         dataset_path = base_dir / "Dataset-framing_annotations-Llama-3.3-70B-Instruct-Turbo.csv"
-        
+
         if not dataset_path.exists():
             raise HTTPException(
                 status_code=503,
                 detail="Dataset file not found"
             )
-        
-        logger.info(f"Streaming search of dataset {dataset_path} for '{topic}'")
+
+        logger.info(f"Streaming search of dataset {dataset_path} for '{topic}' (precomputed labels only)")
         keyword_lower = topic.lower()
         limit = request.limit or 3
         label_filter = (request.label or "").strip().lower() or None
-        
+
+        # Candidate columns for precomputed framing labels
+        label_column_candidates = [
+            "framing_label",
+            "framing",
+            "frame_label",
+            "predicted_label",
+            "label",
+            "class",
+            "category",
+        ]
+
         results = []
-        
+
         with open(dataset_path, "r", encoding="utf-8", newline="") as f:
             reader = csv.DictReader(f)
-            
+            fieldnames = reader.fieldnames or []
+
+            # Determine which column holds the precomputed framing label
+            label_col = None
+            for col in label_column_candidates:
+                if col in fieldnames:
+                    label_col = col
+                    logger.info(f"Using '{label_col}' as framing label column for topic search")
+                    break
+
             for row in reader:
-                # Stop once we have enough results
                 if len(results) >= limit:
                     break
-                
+
                 # Extract title and body text from common columns
                 title = ""
                 body = ""
-                
+
                 for col in ["title", "headline"]:
-                    if col in reader.fieldnames and row.get(col):
+                    if col in fieldnames and row.get(col):
                         title = str(row[col])
                         break
-                
+
                 for col in ["text", "body", "article_text", "content"]:
-                    if col in reader.fieldnames and row.get(col):
+                    if col in fieldnames and row.get(col):
                         body = str(row[col])
                         break
-                
+
                 if not (title or body):
                     continue
-                
+
+                # Keyword match in title+body
                 text_for_match = f"{title} {body}".lower()
                 if keyword_lower not in text_for_match:
                     continue
-                
-                try:
-                    # Run the analyzer
-                    analysis_result = analyzer.analyze_article(title, body)
-                    
-                    # If a framing filter is set, filter by predicted label
-                    if label_filter:
-                        pred_label = (
-                            analysis_result.get("classification_analysis", {}).get("predicted_label")
-                            or analysis_result.get("ordinal_analysis", {}).get("predicted_label")
-                            or ""
-                        )
-                        if pred_label.strip().lower() != label_filter:
-                            continue
-                    
-                    result = {
-                        "title": title,
-                        "body": body,
-                        "body_preview": body[:500] if len(body) > 500 else body,
-                        "source": row.get("source", row.get("media_name", "")),
-                        "source_url": row.get("url", row.get("source_url", "")),
-                        "publish_date": row.get("publish_date") or None,
-                        "analysis": {
-                            "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
-                            "classification_analysis": analysis_result.get("classification_analysis", {})
-                        },
-                        "ordinal_analysis": analysis_result.get("ordinal_analysis", {}),
-                        "classification_analysis": analysis_result.get("classification_analysis", {})
-                    }
-                    results.append(result)
-                except Exception as e:
-                    logger.warning(f"Failed to analyze article during topic search: {str(e)}")
-                    continue
-        
-        logger.info(f"Topic search for '{topic}' returning {len(results)} results")
-        
+
+                # Get precomputed label from dataset (if available)
+                dataset_label_raw = (row.get(label_col) if label_col else "") or ""
+                dataset_label_clean = dataset_label_raw.strip()
+                dataset_label_lower = dataset_label_clean.lower()
+
+                # Apply framing filter from frontend (neutral/loaded/alarmist)
+                if label_filter:
+                    # Map user label to canonical lowercase form
+                    allowed = {
+                        "neutral": ["neutral"],
+                        "loaded": ["loaded"],
+                        "alarmist": ["alarmist"],
+                    }.get(label_filter, [label_filter])
+
+                    if dataset_label_lower not in allowed:
+                        continue
+
+                # Normalize label to title case for display
+                if dataset_label_lower in ("neutral", "loaded", "alarmist"):
+                    normalized_label = dataset_label_lower.capitalize()
+                else:
+                    normalized_label = dataset_label_clean or "Neutral"
+
+                # Map label to class index (0: Neutral, 1: Loaded, 2: Alarmist)
+                label_to_index = {"neutral": 0, "loaded": 1, "alarmist": 2}
+                predicted_class = label_to_index.get(dataset_label_lower, 0)
+
+                # Build minimal analysis stubs from precomputed label
+                classification_analysis = {
+                    "model_type": "3-class-precomputed",
+                    "predicted_class": predicted_class,
+                    "predicted_label": normalized_label,
+                    "confidence": None,
+                    "all_probabilities": {
+                        "Neutral": None,
+                        "Loaded": None,
+                        "Alarmist": None,
+                    },
+                }
+
+                # For ordinal, we don't have precomputed scores here; reuse label only
+                ordinal_analysis = {
+                    "model_type": "ordinal-precomputed",
+                    "predicted_class": predicted_class,
+                    "predicted_label": normalized_label,
+                    "confidence": None,
+                    "scale_score": None,
+                    "all_probabilities": {
+                        "Neutral": None,
+                        "Loaded": None,
+                        "Alarmist": None,
+                    },
+                }
+
+                result = {
+                    "title": title or topic,
+                    "body": body,
+                    "body_preview": body[:500] if len(body) > 500 else body,
+                    "source": row.get("source", row.get("media_name", "")),
+                    "source_url": row.get("url", row.get("source_url", "")),
+                    "publish_date": row.get("publish_date") or None,
+                    "analysis": {
+                        "ordinal_analysis": ordinal_analysis,
+                        "classification_analysis": classification_analysis,
+                    },
+                    "ordinal_analysis": ordinal_analysis,
+                    "classification_analysis": classification_analysis,
+                }
+                results.append(result)
+
+        logger.info(f"Topic search for '{topic}' returning {len(results)} results (precomputed labels)")
+
         return {
             "success": True,
             "topic": topic,
-            "results": results
+            "results": results,
         }
-    
+
     except Exception as e:
         logger.error(f"Error searching dataset: {str(e)}")
         import traceback
         logger.error(traceback.format_exc())
         raise HTTPException(
             status_code=500,
-            detail=f"Error searching dataset: {str(e)}"
+            detail=f"Error searching dataset: {str(e)}",
         )
 
 @app.get("/model-info")
