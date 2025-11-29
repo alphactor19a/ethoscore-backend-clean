@@ -1,6 +1,6 @@
 """
 FastAPI backend for EthoScore Article Analysis
-Version: 2.2.0 - Memory-efficient streaming CSV search (no pandas load)
+Version: 2.3.0 - Added /analyze/url and /analyze/text endpoints
 """
 
 import os
@@ -521,6 +521,18 @@ class AnalyzeRequest(BaseModel):
     title: str = Field(..., description="Article title")
     body: str = Field(..., description="Article body text")
 
+class AnalyzeURLRequest(BaseModel):
+    url: str = Field(..., description="URL of article to analyze")
+
+class AnalyzeTextRequest(BaseModel):
+    title: str = Field("", description="Article title (optional)")
+    body: str = Field(..., description="Article body text")
+    text: Optional[str] = Field(None, description="Alias for body text")
+    
+    def get_body(self) -> str:
+        """Get the body text, preferring body over text"""
+        return self.body or self.text or ""
+
 class AnalyzeResponse(BaseModel):
     success: bool
     data: Optional[Dict[str, Any]] = None
@@ -578,6 +590,75 @@ async def analyze_article(request: AnalyzeRequest):
     
     try:
         result = analyzer.analyze_article(request.title, request.body)
+        return AnalyzeResponse(success=True, data=result)
+    except ModelInferenceError as e:
+        logger.error(f"Inference error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/analyze/url", response_model=AnalyzeResponse)
+async def analyze_url(request: AnalyzeURLRequest):
+    """Analyze an article from URL for framing bias"""
+    global analyzer
+    
+    if analyzer is None or not analyzer.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Models not initialized. Please check server logs and ensure model files are available."
+        )
+    
+    try:
+        # Import article processor for URL extraction
+        from src.article_processor import extract_article_from_url, ArticleExtractionError
+        
+        logger.info(f"Extracting article from URL: {request.url}")
+        title, body, metadata = extract_article_from_url(request.url)
+        
+        logger.info(f"Analyzing extracted article: '{title[:50]}...'")
+        result = analyzer.analyze_article(title, body)
+        
+        # Add metadata to result
+        result["metadata"] = metadata
+        result["source_url"] = request.url
+        
+        return AnalyzeResponse(success=True, data=result)
+    except ArticleExtractionError as e:
+        logger.error(f"Article extraction error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Failed to extract article: {str(e)}")
+    except ModelInferenceError as e:
+        logger.error(f"Inference error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+    except Exception as e:
+        logger.error(f"Unexpected error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error processing URL: {str(e)}")
+
+
+@app.post("/analyze/text", response_model=AnalyzeResponse)
+async def analyze_text(request: AnalyzeTextRequest):
+    """Analyze pasted text for framing bias"""
+    global analyzer
+    
+    if analyzer is None or not analyzer.is_initialized:
+        raise HTTPException(
+            status_code=503,
+            detail="Models not initialized. Please check server logs and ensure model files are available."
+        )
+    
+    body = request.get_body()
+    if not body or len(body.strip()) < 10:
+        raise HTTPException(
+            status_code=400,
+            detail="Text body is required and must be at least 10 characters"
+        )
+    
+    title = request.title.strip() if request.title else "Untitled Article"
+    
+    try:
+        logger.info(f"Analyzing pasted text: '{title[:50]}...' ({len(body)} chars)")
+        result = analyzer.analyze_article(title, body)
         return AnalyzeResponse(success=True, data=result)
     except ModelInferenceError as e:
         logger.error(f"Inference error: {str(e)}")
